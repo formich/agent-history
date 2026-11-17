@@ -1,0 +1,899 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["textual>=1.0"]
+# ///
+"""agent-history — browse, search and resume your Claude Code and Codex conversations.
+
+Usage:
+  agent-history [query]   open the app, optionally with an initial search
+  agent-history --list    print a plain list (date, agent, project, title)
+  agent-history --help    show this help
+
+Environment:
+  AGENT_HISTORY_LANG    "en" or "it" (default: from LANG / LC_ALL)
+  AGENT_HISTORY_ROOTS   colon-separated folder names under $HOME that hold your
+                        repos (default: Dev:dev:code:src:projects:repos:git:workspace:Developer)
+  CLAUDE_CONFIG_DIR     Claude Code data dir (default: ~/.claude)
+  CODEX_HOME            Codex data dir (default: ~/.codex)
+
+https://github.com/formich/agent-history — MIT License
+"""
+from __future__ import annotations
+
+import dataclasses
+import glob
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from collections import Counter
+from datetime import datetime, timedelta
+
+from rich.console import Group
+from rich.markdown import Markdown
+from rich.padding import Padding
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.theme import BUILTIN_THEMES
+from textual.widgets import Footer, Input, Label, OptionList, Sparkline, Static
+from textual.widgets.option_list import Option
+
+__version__ = "2.0.0"
+
+HOME = os.path.expanduser("~")
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+CODEX_DIR = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"),
+                     "agent-history", "index-v3.json")
+ROOTS = set((os.environ.get("AGENT_HISTORY_ROOTS") or os.environ.get("CLAUDE_HISTORY_ROOTS")
+             or "Dev:dev:code:src:projects:repos:git:workspace:Developer").split(":"))
+
+# ── i18n ───────────────────────────────────────────────────────────────────
+
+STRINGS = {
+    "en": {
+        "months": ["January", "February", "March", "April", "May", "June", "July",
+                   "August", "September", "October", "November", "December"],
+        "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+        "today": "Today", "yesterday": "Yesterday", "last_week": "Last week", "no_date": "No date",
+        "lt_minute": "under a minute", "day": "1 day", "days_n": "{n} days",
+        "messages": "{n} messages", "message": "1 message", "folder_gone": "folder removed",
+        "search": "Search titles and everything you wrote",
+        "of": " of {n}", "agents": "Agents", "projects": "Projects", "conversations": "Conversations",
+        "preview": "Preview", "all": "All", "activity": "ACTIVITY · 30 DAYS",
+        "today_lc": "today ", "peak": "  ·  peak ",
+        "empty_title": "No conversations found",
+        "empty_hint": "Try fewer words, or pick “All” in the side lists.",
+        "agent": "agent", "project": "project", "folder": "folder", "branch": "branch",
+        "when": "when", "msgs": "messages", "msgs_detail": "{u} yours · {a} from {agent}",
+        "folder_missing": "  ⚠ no longer exists: Enter recreates it empty",
+        "you": "You", "read_all": "press v to read the whole conversation",
+        "full": "Full conversation", "short": "Short view",
+        "copied": "Resume command copied to clipboard", "copied_t": "Copied",
+        "no_folder": "That folder no longer exists",
+        "renamed": "Renamed to “{name}”", "saved": "Saved",
+        "no_rename": "Rename it from Codex itself: renaming here works for Claude Code only",
+        "rename_title": "Rename conversation", "rename_hint": "Enter to save · Esc to cancel",
+        "k_resume": "Resume", "k_search": "Search", "k_full": "Full/Short", "k_rename": "Rename",
+        "k_copy": "Copy command", "k_open": "Open folder", "k_projects": "Projects",
+        "k_back": "Back", "k_quit": "Quit", "k_cancel": "Cancel",
+        "recreated": "(recreated empty folder: {cwd})",
+        "no_cli": "{cli} is not on your PATH. To resume, run:\n  {cmd}",
+        "none_found": "No Claude Code or Codex sessions found in {a} or {b}",
+    },
+    "it": {
+        "months": ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
+                   "agosto", "settembre", "ottobre", "novembre", "dicembre"],
+        "days": ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"],
+        "today": "Oggi", "yesterday": "Ieri", "last_week": "Settimana scorsa", "no_date": "Senza data",
+        "lt_minute": "meno di un minuto", "day": "1 giorno", "days_n": "{n} giorni",
+        "messages": "{n} messaggi", "message": "1 messaggio", "folder_gone": "cartella rimossa",
+        "search": "Cerca nei titoli e in tutto quello che hai scritto",
+        "of": " di {n}", "agents": "Agenti", "projects": "Progetti", "conversations": "Conversazioni",
+        "preview": "Anteprima", "all": "Tutti", "activity": "ATTIVITÀ · 30 GIORNI",
+        "today_lc": "oggi ", "peak": "  ·  picco ",
+        "empty_title": "Nessuna conversazione trovata",
+        "empty_hint": "Prova con meno parole, oppure scegli “Tutti” nelle liste a sinistra.",
+        "agent": "agente", "project": "progetto", "folder": "cartella", "branch": "branch",
+        "when": "quando", "msgs": "messaggi", "msgs_detail": "{u} tuoi · {a} risposte di {agent}",
+        "folder_missing": "  ⚠ non esiste più: Invio la ricrea vuota",
+        "you": "Tu", "read_all": "premi v per leggere tutta la conversazione",
+        "full": "Conversazione completa", "short": "Vista breve",
+        "copied": "Comando per riprenderla copiato negli appunti", "copied_t": "Copiato",
+        "no_folder": "La cartella non esiste più",
+        "renamed": "Rinominata in “{name}”", "saved": "Salvato",
+        "no_rename": "Rinominala da Codex: qui la rinomina funziona solo per Claude Code",
+        "rename_title": "Rinomina conversazione", "rename_hint": "Invio per salvare · Esc per annullare",
+        "k_resume": "Riprendi", "k_search": "Cerca", "k_full": "Tutta/Breve", "k_rename": "Rinomina",
+        "k_copy": "Copia comando", "k_open": "Apri cartella", "k_projects": "Progetti",
+        "k_back": "Indietro", "k_quit": "Esci", "k_cancel": "Annulla",
+        "recreated": "(cartella ricreata vuota: {cwd})",
+        "no_cli": "{cli} non è nel PATH. Per riprenderla esegui:\n  {cmd}",
+        "none_found": "Nessuna sessione di Claude Code o Codex trovata in {a} o {b}",
+    },
+}
+
+
+def _detect_lang() -> str:
+    forced = (os.environ.get("AGENT_HISTORY_LANG") or os.environ.get("CLAUDE_HISTORY_LANG") or "")
+    if forced.lower()[:2] in STRINGS:
+        return forced.lower()[:2]
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        if os.environ.get(var, "").lower().startswith("it"):
+            return "it"
+    return "en"
+
+
+S = STRINGS[_detect_lang()]
+
+# ── design tokens ──────────────────────────────────────────────────────────
+# Layout: search-first top bar · sidebar (agents + projects as legend/filters,
+#         activity below) · list · preview. Blue is the only UI accent; text
+#         stays in neutral ink; each agent has a glyph + name, never colour alone.
+INK = "#c0caf5"        # primary text
+INK_2 = "#a9b1d6"      # secondary text
+MUTED = "#737aa2"      # captions, metadata
+BLUE = "#7aa2f7"       # accent (selection, focus, your messages)
+HILITE = "#e0af68"     # search match
+CRITICAL = "#f7768e"   # status: missing folder (always with icon + label)
+RULE = "#2f3549"
+# Categorical project colours: colour-blind-safe palette validated on the
+# dark surface (lightness band, chroma, CVD ΔE ≥ 8.4, contrast ≥ 3:1).
+# Fixed order, assigned by first appearance; projects past slot 6 fold to neutral.
+PALETTE = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#0ca30c"]
+OTHER = "#565f89"
+PROJECT_COLOR: dict[str, str] = {}
+
+AGENTS = {
+    "claude": {"name": "Claude Code", "short": "Claude", "glyph": "✻", "color": "#ff9e64"},
+    "codex": {"name": "Codex", "short": "Codex", "glyph": "◇", "color": "#7dcfff"},
+}
+
+
+# ───────────────────────────── parsing ─────────────────────────────
+
+TEXT_TYPES = {"text", "input_text", "output_text"}
+NOISE_PREFIXES = ("<", "# AGENTS.md instructions", "# Context from my IDE setup")
+
+
+def text_of(content) -> str:
+    """Human-written text of a message (skips tool calls/results and injected context)."""
+    if isinstance(content, str):
+        parts = [content]
+    elif isinstance(content, list):
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") in TEXT_TYPES]
+    else:
+        return ""
+    return "\n".join(p.strip() for p in parts
+                     if p and not p.lstrip().startswith(NOISE_PREFIXES)).strip()
+
+
+def iter_records(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+
+def new_info(path: str, agent: str, sid: str) -> dict:
+    return {"path": path, "agent": agent, "id": sid, "cwd": None, "branch": None,
+            "ai_title": None, "custom_title": None, "prompts": [], "first": None,
+            "last": None, "n_user": 0, "n_asst": 0, "hidden": False}
+
+
+def touch(info: dict, ts) -> None:
+    if ts:
+        info["first"] = info["first"] or ts
+        info["last"] = ts
+
+
+def add_message(info: dict, role: str, txt: str) -> None:
+    if not txt:
+        return
+    if role == "user":
+        info["n_user"] += 1
+        info["prompts"].append(txt[:600])
+    else:
+        info["n_asst"] += 1
+
+
+# Claude Code: ~/.claude/projects/<folder>/<session-id>.jsonl
+def scan_claude(path: str) -> dict:
+    info = new_info(path, "claude", os.path.basename(path)[:-6])
+    for d in iter_records(path):
+        t = d.get("type")
+        if t == "ai-title" and d.get("aiTitle"):
+            info["ai_title"] = d["aiTitle"]
+        elif t == "custom-title" and d.get("customTitle"):
+            info["custom_title"] = d["customTitle"]
+        elif t == "summary" and d.get("summary") and not info["ai_title"]:
+            info["ai_title"] = d["summary"]
+        elif t in ("user", "assistant") and not d.get("isSidechain") and not d.get("isMeta"):
+            touch(info, d.get("timestamp"))
+            if t == "user":
+                info["cwd"] = info["cwd"] or d.get("cwd")
+                info["branch"] = d.get("gitBranch") or info["branch"]
+            add_message(info, t, text_of((d.get("message") or {}).get("content")))
+    return info
+
+
+def claude_messages(path: str):
+    for d in iter_records(path):
+        t = d.get("type")
+        if t in ("user", "assistant") and not d.get("isSidechain") and not d.get("isMeta"):
+            yield t, d.get("timestamp"), text_of((d.get("message") or {}).get("content"))
+
+
+# Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl, titles in session_index.jsonl
+def scan_codex(path: str) -> dict:
+    info = new_info(path, "codex", "")
+    for d in iter_records(path):
+        t, p = d.get("type"), d.get("payload") or {}
+        if t == "session_meta":
+            info["id"] = p.get("id") or p.get("session_id") or ""
+            info["cwd"] = p.get("cwd")
+            git = p.get("git") or {}
+            info["branch"] = git.get("branch") if isinstance(git, dict) else None
+            src = p.get("source")
+            # sub-agents (e.g. the approval "guardian") aren't conversations you had
+            info["hidden"] = isinstance(src, dict) and "subagent" in src
+        elif t == "turn_context" and p.get("cwd"):
+            info["cwd"] = info["cwd"] or p["cwd"]
+        elif t == "response_item" and p.get("type") == "message" and p.get("role") in ("user", "assistant"):
+            touch(info, d.get("timestamp"))
+            add_message(info, p["role"], text_of(p.get("content")))
+    return info
+
+
+def codex_messages(path: str):
+    for d in iter_records(path):
+        p = d.get("payload") or {}
+        if d.get("type") == "response_item" and p.get("type") == "message" \
+                and p.get("role") in ("user", "assistant"):
+            yield p["role"], d.get("timestamp"), text_of(p.get("content"))
+
+
+def codex_titles() -> dict[str, str]:
+    titles: dict[str, str] = {}
+    path = os.path.join(CODEX_DIR, "session_index.jsonl")
+    if os.path.exists(path):
+        for d in iter_records(path):  # append-only: the last name wins
+            if d.get("id") and d.get("thread_name"):
+                titles[d["id"]] = d["thread_name"]
+    return titles
+
+
+SOURCES = {
+    "claude": (lambda: glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", "*.jsonl")), scan_claude),
+    "codex": (lambda: glob.glob(os.path.join(CODEX_DIR, "sessions", "**", "rollout-*.jsonl"), recursive=True)
+              + glob.glob(os.path.join(CODEX_DIR, "archived_sessions", "**", "rollout-*.jsonl"), recursive=True),
+              scan_codex),
+}
+
+
+def messages_of(i: dict):
+    return (claude_messages if i["agent"] == "claude" else codex_messages)(i["path"])
+
+
+# ───────────────────────────── index ─────────────────────────────
+
+def load_index() -> list[dict]:
+    try:
+        with open(CACHE) as fh:
+            cache = json.load(fh)
+    except (OSError, ValueError):
+        cache = {}
+    seen, out, changed = set(), [], False
+    for agent, (find, scan) in SOURCES.items():
+        for f in find():
+            seen.add(f)
+            mtime = os.path.getmtime(f)
+            hit = cache.get(f)
+            if not hit or hit.get("mtime") != mtime:
+                hit = scan(f)
+                hit["mtime"] = mtime
+                cache[f] = hit
+                changed = True
+            if hit["prompts"] and not hit["hidden"]:
+                out.append(hit)
+    for f in [f for f in cache if f not in seen]:
+        del cache[f]
+        changed = True
+    if changed:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE + ".tmp", "w") as fh:
+            json.dump(cache, fh)
+        os.replace(CACHE + ".tmp", CACHE)
+    titles = codex_titles()
+    for i in out:
+        if i["agent"] == "codex":
+            i["ai_title"] = titles.get(i["id"]) or i["ai_title"]
+        enrich(i)
+    # colour follows the entity: assign by first appearance, never by rank
+    firsts: dict[str, str] = {}
+    for i in out:
+        p, f = i["project"], i["first"] or "9"
+        firsts[p] = min(firsts.get(p, f), f)
+    for n, p in enumerate(sorted(firsts, key=firsts.get)):
+        PROJECT_COLOR[p] = PALETTE[n] if n < len(PALETTE) else OTHER
+    out.sort(key=lambda i: i["last"] or "", reverse=True)
+    return out
+
+
+def enrich(i: dict) -> None:
+    ct = i["custom_title"]
+    if ct and ct.lstrip().startswith("<"):
+        ct = None
+    i["starred"] = bool(ct)
+    i["title"] = " ".join((ct or i["ai_title"] or i["prompts"][0].splitlines()[0]).split())
+    i["project"], i["place"] = project_of(i["cwd"])
+    i["dt"] = parse_ts(i["last"])
+    i["dt_first"] = parse_ts(i["first"])
+    i["haystack"] = " ".join([i["title"], i["cwd"] or "", i["branch"] or "",
+                              AGENTS[i["agent"]]["name"], *i["prompts"]]).lower()
+    i["exists"] = bool(i["cwd"]) and os.path.isdir(i["cwd"])
+
+
+def project_of(cwd: str | None) -> tuple[str, str]:
+    """Group a working directory into (project, place-inside-project).
+
+    Handles git worktrees kept in a ``worktrees/<repo>/<name>`` folder, Claude
+    Code's ``<repo>/.claude/worktrees/<name>`` and the Codex app's
+    ``~/Documents/Codex/<date>/<task>`` scratch folders.
+    """
+    if not cwd:
+        return "?", ""
+    rel = os.path.relpath(cwd, HOME) if cwd.startswith(HOME) else cwd.strip(os.sep)
+    parts = [] if rel == "." else rel.split(os.sep)
+    if not parts:
+        return "home", ""
+    if parts[:2] == ["Documents", "Codex"]:
+        return "Codex", "/".join(parts[3:] or parts[2:])
+    for n, p in enumerate(parts[:-1]):
+        if p == ".claude" and parts[n + 1] == "worktrees" and n > 0:
+            return parts[n - 1], "/".join(parts[n + 2:])
+        if p == "worktrees" and n + 1 < len(parts):
+            return parts[n + 1], "/".join(parts[n + 2:])
+    if parts[0] in ROOTS and len(parts) >= 2:
+        return parts[1], "/".join(parts[2:])
+    return parts[0], "/".join(parts[1:])
+
+
+def parse_ts(ts):
+    if not ts:
+        return None
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+
+
+def color_for(project: str) -> str:
+    return PROJECT_COLOR.get(project, OTHER)
+
+
+def resume_argv(i: dict) -> list[str]:
+    if i["agent"] == "codex":
+        return ["codex", "resume", i["id"]]
+    return ["claude", "--resume", i["id"]]
+
+
+def resume_command(i: dict) -> str:
+    return f"cd {shlex.quote(i['cwd'] or HOME)} && {shlex.join(resume_argv(i))}"
+
+
+def bucket(dt: datetime | None) -> str:
+    if not dt:
+        return S["no_date"]
+    today = datetime.now().astimezone().date()
+    d = dt.date()
+    delta = (today - d).days
+    if delta == 0:
+        return S["today"]
+    if delta == 1:
+        return S["yesterday"]
+    if delta < 7:
+        return f"{S['days'][d.weekday()].capitalize()} {d.day} {S['months'][d.month - 1][:3]}"
+    if delta < 14:
+        return S["last_week"]
+    return f"{S['months'][d.month - 1].capitalize()} {d.year}"
+
+
+def human_duration(a, b) -> str:
+    if not a or not b:
+        return ""
+    s = int((b - a).total_seconds())
+    if s < 60:
+        return S["lt_minute"]
+    if s < 3600:
+        return f"{s // 60} min"
+    if s < 86400:
+        return f"{s // 3600} h {s % 3600 // 60:02d} min"
+    g = s // 86400
+    return S["day"] if g == 1 else S["days_n"].format(n=g)
+
+
+# ───────────────────────────── rows ─────────────────────────────
+
+def fit(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:max(1, n - 1)] + "…"
+
+
+def agent_mark(agent: str, bold: bool = False) -> Text:
+    a = AGENTS[agent]
+    return Text.assemble((a["glyph"] + " ", f"bold {a['color']}"),
+                         (a["short"], f"bold {INK}" if bold else MUTED))
+
+
+def row_prompt(i: dict, terms: list[str], width: int = 56) -> Text:
+    t = Text(no_wrap=True, overflow="ellipsis")
+    if i["starred"]:
+        t.append("★ ", style=f"bold {HILITE}")
+    title = Text(fit(i["title"], width - (2 if i["starred"] else 0)), style=f"bold {INK}")
+    title.highlight_words(terms, style=f"reverse {HILITE}", case_sensitive=False)
+    t.append_text(title)
+    t.append("\n")
+    t.append("● ", style=color_for(i["project"]))
+    t.append(i["project"], style=INK_2)
+    if i["place"]:
+        t.append("  " + fit(i["place"], width - len(i["project"]) - 4), style=MUTED)
+    t.append("\n  ")
+    t.append_text(agent_mark(i["agent"]))
+    when = f"  ·  {i['dt']:%H:%M}" if i["dt"] else ""
+    count = S["message"] if i["n_user"] == 1 else S["messages"].format(n=i["n_user"])
+    t.append(f"{when}  ·  {count}", style=MUTED)
+    if not i["exists"]:
+        t.append(f"  ·  ⚠ {S['folder_gone']}", style=CRITICAL)
+    snip = snippet(i, terms, width)
+    if snip:
+        t.append("\n")
+        t.append_text(snip)
+    t.append("\n")
+    return t
+
+
+def snippet(i: dict, terms: list[str], width: int) -> Text | None:
+    if not terms or all(term in i["title"].lower() for term in terms):
+        return None
+    body = " ".join(" ".join(i["prompts"]).split())
+    low = body.lower()
+    pos = next((low.find(t) for t in terms if low.find(t) >= 0), -1)
+    if pos < 0:
+        return None
+    start = max(0, pos - 20)
+    frag = fit(("…" if start else "") + body[start:], width - 2)
+    s = Text("  " + frag, style=f"italic {MUTED}", no_wrap=True, overflow="ellipsis")
+    s.highlight_words(terms, style=f"bold {HILITE}", case_sensitive=False)
+    return s
+
+
+def side_row(dot: Text, name: str, n: int, bold=False, width: int = 22) -> Text:
+    t = Text(no_wrap=True, overflow="ellipsis")
+    t.append_text(dot)
+    label = fit(name, width - len(str(n)) - 1)
+    t.append(label, style=f"{'bold ' if bold else ''}{INK}")
+    t.append(" " * max(1, width - len(label) - len(str(n))))
+    t.append(str(n), style=MUTED)
+    return t
+
+
+# ───────────────────────────── app ─────────────────────────────
+
+class ConversationList(OptionList):
+    BINDINGS = [Binding("enter", "select", S["k_resume"])]
+
+
+class RenameScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "dismiss(None)", S["k_cancel"])]
+
+    def __init__(self, current: str):
+        super().__init__()
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(S["rename_title"], id="dialog-title")
+            yield Input(value=self.current, id="rename-input")
+            yield Label(S["rename_hint"], id="dialog-hint")
+
+    @on(Input.Submitted)
+    def done(self, ev: Input.Submitted) -> None:
+        self.dismiss(ev.value.strip() or None)
+
+
+def make_theme():
+    base = BUILTIN_THEMES["tokyo-night"]
+    return dataclasses.replace(base, name="agent-history", primary=BLUE,
+                               secondary="#7dcfff", accent="#ff9e64")
+
+
+class AgentHistory(App):
+    TITLE = "Agent History"
+    CSS = """
+    Screen { background: $background; }
+    #agents, #projects, #list, #preview { border-title-color: $text-muted; }
+    #agents:focus, #projects:focus, #list:focus, #preview:focus-within { border-title-color: $primary; }
+
+    /* top bar: brand + search (the primary action) */
+    #top { height: 3; padding: 0 1; }
+    #brand { width: 20; height: 3; content-align: left middle; }
+    #search { width: 1fr; border: round #3b4261; background: $background; }
+    #search:focus { border: round $primary; }
+    #count { width: 20; height: 3; content-align: right middle; color: $text-muted; }
+
+    /* sidebar: filters that double as legends, activity as secondary info */
+    #sidebar { width: 30; padding: 0 0 0 1; }
+    #agents { height: auto; max-height: 6; border: round #3b4261; background: $background; }
+    #agents:focus { border: round $primary; }
+    #projects { height: 1fr; border: round #3b4261; background: $background; }
+    #projects:focus { border: round $primary; }
+    #activity { height: 7; padding: 0 1; }
+    #activity-label { color: $text-muted; text-style: bold; }
+    #spark { height: 2; margin: 1 0 0 0; }
+    #spark > .sparkline--max-color { color: $primary; }
+    #spark > .sparkline--min-color { color: $primary 25%; }
+
+    #list { width: 1fr; min-width: 40; max-width: 64; border: round #3b4261; background: $background; }
+    #list:focus { border: round $primary; }
+    OptionList > .option-list--option-highlighted { background: $primary 18%; }
+    OptionList:focus > .option-list--option-highlighted { background: $primary 30%; }
+
+    #preview { width: 1fr; border: round #3b4261; padding: 0 2; margin: 0 1 0 0; }
+    #preview:focus-within { border: round $primary; }
+
+    RenameScreen { align: center middle; }
+    #dialog { width: 70; height: auto; padding: 1 2; border: round $primary; background: $panel; }
+    #dialog-title { text-style: bold; padding-bottom: 1; }
+    #dialog-hint { color: $text-muted; padding-top: 1; }
+    """
+    BINDINGS = [
+        Binding("slash", "focus_search", S["k_search"]),
+        Binding("v", "toggle_full", S["k_full"]),
+        Binding("r", "rename", S["k_rename"]),
+        Binding("c", "copy", S["k_copy"]),
+        Binding("o", "open_folder", S["k_open"]),
+        Binding("p", "focus_projects", S["k_projects"], show=False),
+        Binding("escape", "back", S["k_back"], show=False),
+        Binding("q", "quit", S["k_quit"]),
+    ]
+
+    def __init__(self, query: str = ""):
+        super().__init__()
+        self.initial_query = query
+        self.index: list[dict] = []
+        self.rows: list[dict] = []
+        self.agent_filter: str | None = None
+        self.project_filter: str | None = None
+        self.current: dict | None = None
+        self.full = False
+        self.resume_target: dict | None = None
+        self._preview_timer = None
+
+    # ---- layout
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="top"):
+            yield Static(Text.assemble(("◆ ", f"bold {BLUE}"), ("Agent History", f"bold {INK}")),
+                         id="brand")
+            yield Input(placeholder=S["search"], id="search")
+            yield Static(id="count")
+        with Horizontal(id="body"):
+            with Vertical(id="sidebar"):
+                yield OptionList(id="agents")
+                yield OptionList(id="projects")
+                with Vertical(id="activity"):
+                    yield Label(S["activity"], id="activity-label")
+                    yield Sparkline([0], id="spark")
+                    yield Static(id="activity-caption")
+            yield ConversationList(id="list")
+            with VerticalScroll(id="preview"):
+                yield Static(id="preview-body")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.register_theme(make_theme())
+        self.theme = "agent-history"
+        self.query_one("#agents").border_title = S["agents"]
+        self.query_one("#projects").border_title = S["projects"]
+        self.query_one("#list").border_title = S["conversations"]
+        self.query_one("#preview").border_title = S["preview"]
+        self.index = load_index()
+        self.build_activity()
+        self.build_agents()
+        self.build_projects()
+        self.query_one("#search", Input).value = self.initial_query
+        self.refresh_list()
+        self.query_one("#list").focus()
+
+    def build_activity(self) -> None:
+        today = datetime.now().astimezone().date()
+        per_day = Counter(i["dt"].date() for i in self.index if i["dt"])
+        data = [per_day.get(today - timedelta(days=d), 0) for d in range(29, -1, -1)]
+        self.query_one("#spark", Sparkline).data = data
+        self.query_one("#activity-caption", Static).update(Text.assemble(
+            (S["today_lc"], MUTED), (str(data[-1]), f"bold {INK}"),
+            (S["peak"], MUTED), (str(max(data)), f"bold {INK}")))
+
+    def build_agents(self) -> None:
+        ol = self.query_one("#agents", OptionList)
+        counts = Counter(i["agent"] for i in self.index)
+        ol.add_option(Option(side_row(Text("● ", style=INK_2), S["all"], len(self.index), bold=True),
+                             id="__all__"))
+        for agent, meta in AGENTS.items():
+            if counts.get(agent):
+                dot = Text(meta["glyph"] + " ", style=f"bold {meta['color']}")
+                ol.add_option(Option(side_row(dot, meta["name"], counts[agent]), id=f"a:{agent}"))
+        ol.highlighted = 0
+        ol.display = len(counts) > 1  # only useful when more than one agent has sessions
+
+    def build_projects(self) -> None:
+        ol = self.query_one("#projects", OptionList)
+        counts = Counter(i["project"] for i in self.index)
+        ol.add_option(Option(side_row(Text("● ", style=INK_2), S["all"], len(self.index), bold=True),
+                             id="__all__"))
+        for name, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            ol.add_option(Option(side_row(Text("● ", style=color_for(name)), name, n), id=f"p:{name}"))
+        ol.highlighted = 0
+
+    # ---- filtering
+    def terms(self) -> list[str]:
+        return [t for t in self.query_one("#search", Input).value.lower().split() if t]
+
+    def refresh_list(self) -> None:
+        terms = self.terms()
+        self.rows = [i for i in self.index
+                     if (self.agent_filter is None or i["agent"] == self.agent_filter)
+                     and (self.project_filter is None or i["project"] == self.project_filter)
+                     and all(t in i["haystack"] for t in terms)]
+        ol = self.query_one("#list", OptionList)
+        ol.clear_options()
+        last_bucket, first_idx, opts = None, None, []
+        width = max(30, (ol.content_size.width or 60) - 2)
+        for n, i in enumerate(self.rows):
+            b = bucket(i["dt"])
+            if b != last_bucket:
+                opts.append(Option(Text(b.upper(), style=f"bold {MUTED}"), disabled=True))
+                last_bucket = b
+            if first_idx is None:
+                first_idx = len(opts)
+            opts.append(Option(row_prompt(i, terms, width), id=str(n)))
+        ol.add_options(opts)
+        self.query_one("#count", Static).update(Text.assemble(
+            (str(len(self.rows)), f"bold {INK}"), (S["of"].format(n=len(self.index)), MUTED)))
+        if first_idx is not None:
+            ol.highlighted = first_idx
+        else:
+            self.current = None
+            self.query_one("#preview-body", Static).update(Text.assemble(
+                (f"\n{S['empty_title']}\n\n", f"bold {INK}"), (S["empty_hint"], MUTED)))
+
+    @on(Input.Changed, "#search")
+    def search_changed(self) -> None:
+        self.refresh_list()
+
+    @on(Input.Submitted, "#search")
+    def search_submitted(self) -> None:
+        self.query_one("#list").focus()
+
+    @on(OptionList.OptionHighlighted, "#agents")
+    def agent_changed(self, ev: OptionList.OptionHighlighted) -> None:
+        oid = ev.option.id or "__all__"
+        new = None if oid == "__all__" else oid[2:]
+        if new != self.agent_filter:
+            self.agent_filter = new
+            self.refresh_list()
+
+    @on(OptionList.OptionHighlighted, "#projects")
+    def project_changed(self, ev: OptionList.OptionHighlighted) -> None:
+        oid = ev.option.id or "__all__"
+        new = None if oid == "__all__" else oid[2:]
+        if new != self.project_filter:
+            self.project_filter = new
+            self.refresh_list()
+
+    @on(OptionList.OptionSelected, "#agents")
+    @on(OptionList.OptionSelected, "#projects")
+    def side_selected(self) -> None:
+        self.query_one("#list").focus()
+
+    @on(OptionList.OptionHighlighted, "#list")
+    def list_changed(self, ev: OptionList.OptionHighlighted) -> None:
+        if ev.option.id is None:
+            return
+        self.current = self.rows[int(ev.option.id)]
+        self.full = False
+        if self._preview_timer:
+            self._preview_timer.stop()
+        self._preview_timer = self.set_timer(0.08, self.load_preview)
+
+    @on(OptionList.OptionSelected, "#list")
+    def list_selected(self) -> None:
+        self.action_resume()
+
+    # ---- preview
+    def load_preview(self) -> None:
+        if self.current:
+            self.render_preview(self.current, self.full)
+
+    @work(thread=True, exclusive=True)
+    def render_preview(self, i: dict, full: bool) -> None:
+        msgs = [(role, parse_ts(ts), txt) for role, ts, txt in messages_of(i) if txt]
+        renderable = self.build_preview(i, msgs, full)
+        self.call_from_thread(self.show_preview, i, renderable)
+
+    def show_preview(self, i: dict, renderable) -> None:
+        if i is not self.current:
+            return
+        self.query_one("#preview-body", Static).update(renderable)
+        self.query_one("#preview").scroll_home(animate=False)
+
+    def build_preview(self, i: dict, msgs, full: bool):
+        agent = AGENTS[i["agent"]]
+        title = Text()
+        if i["starred"]:
+            title.append("★ ", style=f"bold {HILITE}")
+        title.append(i["title"], style=f"bold {INK}")
+
+        meta = Table.grid(padding=(0, 2))
+        meta.add_column(style=MUTED, no_wrap=True)
+        meta.add_column(style=INK_2)
+        meta.add_row(S["agent"], Text.assemble((agent["glyph"] + " ", f"bold {agent['color']}"),
+                                               (agent["name"], INK_2)))
+        proj = Text.assemble(("● ", color_for(i["project"])), (i["project"], INK_2))
+        if i["place"]:
+            proj.append(f"  {i['place']}", style=MUTED)
+        meta.add_row(S["project"], proj)
+        folder = Text(i["cwd"] or "?", style=INK_2)
+        if not i["exists"]:
+            folder.append(S["folder_missing"], style=CRITICAL)
+        meta.add_row(S["folder"], folder)
+        if i["branch"] and i["branch"] != "HEAD":
+            meta.add_row(S["branch"], Text(f"⎇ {i['branch']}", style=INK_2))
+        if i["dt_first"]:
+            meta.add_row(S["when"], Text.assemble(
+                f"{i['dt_first']:%d/%m/%Y %H:%M} → {i['dt']:%d/%m %H:%M}",
+                (f"   {human_duration(i['dt_first'], i['dt'])}", MUTED)))
+        meta.add_row(S["msgs"], S["msgs_detail"].format(u=i["n_user"], a=i["n_asst"],
+                                                        agent=agent["short"]))
+
+        parts = [Padding(title, (1, 0, 1, 0)), meta, Padding(Rule(style=RULE), (1, 0, 0, 0))]
+        terms = self.terms()
+        limit_u, limit_a = (None, None) if full else (900, 500)
+        shown = msgs if full else msgs[:40]
+        for kind, ts, txt in shown:
+            stamp = f"{ts:%H:%M}" if ts else ""
+            if kind == "user":
+                body = txt if limit_u is None or len(txt) <= limit_u else txt[:limit_u] + " …"
+                bt = Text(body, style=INK)
+                bt.highlight_words(terms, style=f"reverse {HILITE}", case_sensitive=False)
+                parts.append(Padding(Panel(
+                    bt, title=Text(f"› {S['you']}", style=f"bold {BLUE}"),
+                    subtitle=Text(stamp, style=MUTED), title_align="left", subtitle_align="right",
+                    border_style=BLUE, padding=(0, 1)), (1, 0, 0, 0)))
+            else:
+                body = txt if limit_a is None or len(txt) <= limit_a else txt[:limit_a] + " …"
+                parts.append(Padding(Group(
+                    Text.assemble((agent["glyph"] + " ", f"bold {agent['color']}"),
+                                  (agent["short"], f"bold {INK}"), (f"  {stamp}", MUTED)),
+                    Padding(Markdown(body, code_theme="monokai"), (0, 0, 0, 2)),
+                ), (1, 0, 0, 1)))
+        if not full and (len(msgs) > len(shown) or any(len(m[2]) > 500 for m in msgs)):
+            parts.append(Padding(Rule(Text(S["read_all"], style=MUTED), style=RULE), (1, 0)))
+        return Group(*parts)
+
+    # ---- actions
+    def action_resume(self) -> None:
+        if self.current:
+            self.resume_target = self.current
+            self.exit()
+
+    def action_focus_search(self) -> None:
+        self.query_one("#search").focus()
+
+    def action_focus_projects(self) -> None:
+        self.query_one("#projects").focus()
+
+    def action_back(self) -> None:
+        s = self.query_one("#search", Input)
+        if self.focused is s and s.value:
+            s.value = ""
+        else:
+            self.query_one("#list").focus()
+
+    def action_toggle_full(self) -> None:
+        if self.current:
+            self.full = not self.full
+            self.render_preview(self.current, self.full)
+            self.notify(S["full"] if self.full else S["short"], timeout=1.5)
+
+    def action_copy(self) -> None:
+        if not self.current:
+            return
+        cmd = resume_command(self.current)
+        self.copy_to_clipboard(cmd)  # OSC 52, works over SSH in most terminals
+        for tool in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+            try:
+                subprocess.run(tool, input=cmd, text=True, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                break
+            except (OSError, subprocess.CalledProcessError):
+                continue
+        self.notify(S["copied"], title=S["copied_t"])
+
+    def action_open_folder(self) -> None:
+        if not self.current:
+            return
+        if not self.current["exists"]:
+            self.notify(S["no_folder"], severity="warning")
+            return
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        try:
+            subprocess.Popen([opener, self.current["cwd"]],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            self.notify(self.current["cwd"])
+
+    def action_rename(self) -> None:
+        if not self.current:
+            return
+        i = self.current
+        if i["agent"] != "claude":
+            self.notify(S["no_rename"], severity="warning")
+            return
+
+        def save(name: str | None) -> None:
+            if not name or name == i["title"]:
+                return
+            # same record Claude Code's own /rename appends
+            rec = {"type": "custom-title", "customTitle": name, "sessionId": i["id"]}
+            with open(i["path"], "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            i["custom_title"] = name
+            enrich(i)
+            self.refresh_list()
+            self.notify(S["renamed"].format(name=name), title=S["saved"])
+
+        self.push_screen(RenameScreen(i["title"]), save)
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return
+    if args[:1] in (["-V"], ["--version"]):
+        print(f"agent-history {__version__}")
+        return
+    if args[:1] == ["--list"]:
+        for i in load_index():
+            print(f"{i['dt']:%Y-%m-%d %H:%M}\t{AGENTS[i['agent']]['short']}\t{i['project']}\t{i['title']}")
+        return
+    if not (os.path.isdir(os.path.join(CLAUDE_DIR, "projects")) or os.path.isdir(os.path.join(CODEX_DIR, "sessions"))):
+        sys.exit(S["none_found"].format(a=CLAUDE_DIR, b=CODEX_DIR))
+    app = AgentHistory(" ".join(args))
+    app.run()
+    i = app.resume_target
+    if not i:
+        return
+    cwd, argv = i["cwd"] or HOME, resume_argv(i)
+    if not shutil.which(argv[0]):
+        sys.exit(S["no_cli"].format(cli=argv[0], cmd=resume_command(i)))
+    if not os.path.isdir(cwd):
+        # both CLIs look sessions up from the folder they ran in, so it must exist
+        os.makedirs(cwd, exist_ok=True)
+        print(S["recreated"].format(cwd=cwd), file=sys.stderr)
+    os.chdir(cwd)
+    os.execvp(argv[0], argv)
+
+
+if __name__ == "__main__":
+    main()
