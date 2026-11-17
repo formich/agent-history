@@ -66,6 +66,7 @@ SESSIONS = [
       ("a", "Added Playwright with two specs and a CI job.")]),
 ]
 CODEX = {"Rate limiter returns 429 too early", "zsh startup is slow", "Upgrade cluster to Kubernetes 1.31"}
+PI = {"Explain Python asyncio TaskGroup", "Prototype auth flow"}
 STARRED = {"Webhook retries with exponential backoff": "★ Webhooks v2 design"}
 MISSING = {"code/old-prototype"}
 
@@ -82,6 +83,9 @@ def build(tmp: Path) -> None:
         end = now - timedelta(hours=hours)
         start = end - timedelta(minutes=minutes)
         step = (end - start) / max(1, len(msgs) - 1)
+        if title in PI:
+            write_pi(tmp, sid, cwd, title, msgs, start, step)
+            continue
         if title in CODEX:
             write_codex(tmp, sid, cwd, branch, title, msgs, start, step)
             continue
@@ -118,12 +122,28 @@ def write_codex(tmp, sid, cwd, branch, title, msgs, start, step):
         fh.write(json.dumps({"id": sid, "thread_name": title}) + "\n")
 
 
+def write_pi(tmp, sid, cwd, title, msgs, start, step):
+    folder = tmp / "pi" / "sessions" / ("--" + cwd.strip("/").replace("/", "-") + "--")
+    folder.mkdir(parents=True, exist_ok=True)
+    lines = [{"type": "session", "version": 3, "id": sid, "timestamp": iso(start), "cwd": cwd}]
+    parent = None
+    for n, (role, text) in enumerate(msgs):
+        eid = f"{n:08x}"
+        content = text if role == "u" else [{"type": "text", "text": text}]
+        lines.append({"type": "message", "id": eid, "parentId": parent, "timestamp": iso(start + step * n),
+                      "message": {"role": "user" if role == "u" else "assistant", "content": content}})
+        parent = eid
+    name = f"{start:%Y-%m-%dT%H-%M-%S-000Z}_{sid}.jsonl"
+    (folder / name).write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+
+
 async def shoot(query: str) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         build(tmp)
         os.environ.update(HOME=FAKE_HOME, CLAUDE_CONFIG_DIR=str(tmp / "claude"),
-                          CODEX_HOME=str(tmp / "codex"), XDG_CACHE_HOME=str(tmp / "cache"),
+                          CODEX_HOME=str(tmp / "codex"), PI_CODING_AGENT_DIR=str(tmp / "pi"),
+                          XDG_CACHE_HOME=str(tmp / "cache"),
                           AGENT_HISTORY_LANG="en", AGENT_HISTORY_ROOTS="code")
         ch = SourceFileLoader("ah", str(ROOT / "agent-history")).load_module()
         original = ch.enrich

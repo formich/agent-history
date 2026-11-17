@@ -3,11 +3,11 @@
 # requires-python = ">=3.11"
 # dependencies = ["textual>=1.0"]
 # ///
-"""agent-history — browse, search and resume your Claude Code and Codex conversations.
+"""agent-history — browse, search and resume your Claude Code, Codex and pi conversations.
 
 Usage:
   agent-history [query]   open the app, optionally with an initial search
-  agent-history --agent claude|codex [query]
+  agent-history --agent claude|codex|pi [query]
                           open it showing only one agent's conversations
   agent-history --list    print a plain list (date, agent, project, title)
   agent-history --help    show this help
@@ -18,6 +18,8 @@ Environment:
                         repos (default: Dev:dev:code:src:projects:repos:git:workspace:Developer)
   CLAUDE_CONFIG_DIR     Claude Code data dir (default: ~/.claude)
   CODEX_HOME            Codex data dir (default: ~/.codex)
+  PI_CODING_AGENT_DIR   pi agent dir (default: ~/.pi/agent); sessions honour
+                        PI_CODING_AGENT_SESSION_DIR and the "sessionDir" setting
 
 https://github.com/formich/agent-history — MIT License
 """
@@ -41,7 +43,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -50,13 +52,14 @@ from textual.theme import BUILTIN_THEMES
 from textual.widgets import Footer, Input, Label, OptionList, Sparkline, Static
 from textual.widgets.option_list import Option
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
 CODEX_DIR = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+PI_DIR = os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(HOME, ".pi", "agent"))
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"),
-                     "agent-history", "index-v3.json")
+                     "agent-history", "index-v4.json")
 ROOTS = set((os.environ.get("AGENT_HISTORY_ROOTS") or os.environ.get("CLAUDE_HISTORY_ROOTS")
              or "Dev:dev:code:src:projects:repos:git:workspace:Developer").split(":"))
 
@@ -84,14 +87,14 @@ STRINGS = {
         "copied": "Resume command copied to clipboard", "copied_t": "Copied",
         "no_folder": "That folder no longer exists",
         "renamed": "Renamed to “{name}”", "saved": "Saved",
-        "no_rename": "Rename it from Codex itself: renaming here works for Claude Code only",
+        "no_rename": "Rename it from {agent} itself: renaming here works for Claude Code only",
         "rename_title": "Rename conversation", "rename_hint": "Enter to save · Esc to cancel",
         "k_resume": "Resume", "k_search": "Search", "k_full": "Full/Short", "k_rename": "Rename",
         "k_copy": "Copy command", "k_open": "Open folder", "k_projects": "Projects", "k_agent": "Agent",
         "k_back": "Back", "k_quit": "Quit", "k_cancel": "Cancel",
         "recreated": "(recreated empty folder: {cwd})",
         "no_cli": "{cli} is not on your PATH. To resume, run:\n  {cmd}",
-        "none_found": "No Claude Code or Codex sessions found in {a} or {b}",
+        "none_found": "No Claude Code, Codex or pi sessions found in {dirs}",
     },
     "it": {
         "months": ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
@@ -114,14 +117,14 @@ STRINGS = {
         "copied": "Comando per riprenderla copiato negli appunti", "copied_t": "Copiato",
         "no_folder": "La cartella non esiste più",
         "renamed": "Rinominata in “{name}”", "saved": "Salvato",
-        "no_rename": "Rinominala da Codex: qui la rinomina funziona solo per Claude Code",
+        "no_rename": "Rinominala da {agent}: qui la rinomina funziona solo per Claude Code",
         "rename_title": "Rinomina conversazione", "rename_hint": "Invio per salvare · Esc per annullare",
         "k_resume": "Riprendi", "k_search": "Cerca", "k_full": "Tutta/Breve", "k_rename": "Rinomina",
         "k_copy": "Copia comando", "k_open": "Apri cartella", "k_projects": "Progetti", "k_agent": "Agente",
         "k_back": "Indietro", "k_quit": "Esci", "k_cancel": "Annulla",
         "recreated": "(cartella ricreata vuota: {cwd})",
         "no_cli": "{cli} non è nel PATH. Per riprenderla esegui:\n  {cmd}",
-        "none_found": "Nessuna sessione di Claude Code o Codex trovata in {a} o {b}",
+        "none_found": "Nessuna sessione di Claude Code, Codex o pi trovata in {dirs}",
     },
 }
 
@@ -159,6 +162,7 @@ PROJECT_COLOR: dict[str, str] = {}
 AGENTS = {
     "claude": {"name": "Claude Code", "short": "Claude", "glyph": "✻", "color": "#ff9e64"},
     "codex": {"name": "Codex", "short": "Codex", "glyph": "◇", "color": "#7dcfff"},
+    "pi": {"name": "pi", "short": "pi", "glyph": "π", "color": "#9ece6a"},
 }
 
 
@@ -278,16 +282,69 @@ def codex_titles() -> dict[str, str]:
     return titles
 
 
+# pi: <sessions>/--<cwd>--/<timestamp>_<id>.jsonl, a tree of entries (id/parentId);
+# the conversation you see is the path from the last entry back to the root.
+def pi_sessions_dir() -> str:
+    d = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+    if not d:
+        try:
+            with open(os.path.join(PI_DIR, "settings.json")) as fh:
+                d = json.load(fh).get("sessionDir")
+        except (OSError, ValueError, AttributeError):
+            d = None
+    return os.path.expanduser(d) if d else os.path.join(PI_DIR, "sessions")
+
+
+def pi_active_path(path: str) -> tuple[dict | None, list[dict]]:
+    header, entries = None, {}
+    leaf = None
+    for d in iter_records(path):
+        if d.get("type") == "session" and header is None:
+            header = d
+        elif d.get("id"):
+            entries[d["id"]] = d
+            leaf = d["id"]
+    chain, seen = [], set()
+    while leaf and leaf in entries and leaf not in seen:  # guard against cycles
+        seen.add(leaf)
+        chain.append(entries[leaf])
+        leaf = entries[leaf].get("parentId")
+    return header, chain[::-1]
+
+
+def scan_pi(path: str) -> dict:
+    header, chain = pi_active_path(path)
+    info = new_info(path, "pi", (header or {}).get("id") or os.path.basename(path)[:-6].split("_")[-1])
+    info["cwd"] = (header or {}).get("cwd")
+    for d in chain:
+        if d.get("type") == "session_info" and d.get("name"):
+            info["custom_title"] = d["name"]
+        elif d.get("type") == "message":
+            m = d.get("message") or {}
+            if m.get("role") in ("user", "assistant"):
+                touch(info, d.get("timestamp"))
+                add_message(info, m["role"], text_of(m.get("content")))
+    return info
+
+
+def pi_messages(path: str):
+    for d in pi_active_path(path)[1]:
+        m = d.get("message") or {}
+        if d.get("type") == "message" and m.get("role") in ("user", "assistant"):
+            yield m["role"], d.get("timestamp"), text_of(m.get("content"))
+
+
 SOURCES = {
     "claude": (lambda: glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", "*.jsonl")), scan_claude),
     "codex": (lambda: glob.glob(os.path.join(CODEX_DIR, "sessions", "**", "rollout-*.jsonl"), recursive=True)
               + glob.glob(os.path.join(CODEX_DIR, "archived_sessions", "**", "rollout-*.jsonl"), recursive=True),
               scan_codex),
+    "pi": (lambda: glob.glob(os.path.join(pi_sessions_dir(), "*", "*.jsonl")), scan_pi),
 }
 
 
 def messages_of(i: dict):
-    return (claude_messages if i["agent"] == "claude" else codex_messages)(i["path"])
+    return {"claude": claude_messages, "codex": codex_messages, "pi": pi_messages}[i["agent"]](i["path"])
 
 
 # ───────────────────────────── index ─────────────────────────────
@@ -387,6 +444,8 @@ def color_for(project: str) -> str:
 def resume_argv(i: dict) -> list[str]:
     if i["agent"] == "codex":
         return ["codex", "resume", i["id"]]
+    if i["agent"] == "pi":
+        return ["pi", "--session", i["path"]]  # by path: an id from another folder would fork
     return ["claude", "--resume", i["id"]]
 
 
@@ -618,6 +677,15 @@ class AgentHistory(App):
         self.refresh_list()
         self.query_one("#list").focus()
 
+    @on(events.Resize)
+    def relayout_rows(self) -> None:
+        # rows are truncated to the list's width, which is only known after layout
+        self.call_after_refresh(self._fit_rows)
+
+    def _fit_rows(self) -> None:
+        if self.index and self.query_one("#list").content_size.width != getattr(self, "_rows_width", None):
+            self.refresh_list(keep=True)
+
     def build_activity(self) -> None:
         today = datetime.now().astimezone().date()
         per_day = Counter(i["dt"].date() for i in self.index if i["dt"])
@@ -654,7 +722,8 @@ class AgentHistory(App):
     def terms(self) -> list[str]:
         return [t for t in self.query_one("#search", Input).value.lower().split() if t]
 
-    def refresh_list(self) -> None:
+    def refresh_list(self, keep: bool = False) -> None:
+        keep_path = self.current["path"] if keep and self.current else None
         terms = self.terms()
         self.rows = [i for i in self.index
                      if (self.agent_filter is None or i["agent"] == self.agent_filter)
@@ -664,6 +733,8 @@ class AgentHistory(App):
         ol.clear_options()
         last_bucket, first_idx, opts = None, None, []
         width = max(30, (ol.content_size.width or 60) - 2)
+        self._rows_width = ol.content_size.width
+        keep_idx = None
         for n, i in enumerate(self.rows):
             b = bucket(i["dt"])
             if b != last_bucket:
@@ -671,12 +742,14 @@ class AgentHistory(App):
                 last_bucket = b
             if first_idx is None:
                 first_idx = len(opts)
+            if keep_path and i["path"] == keep_path:
+                keep_idx = len(opts)
             opts.append(Option(row_prompt(i, terms, width), id=str(n)))
         ol.add_options(opts)
         self.query_one("#count", Static).update(Text.assemble(
             (str(len(self.rows)), f"bold {INK}"), (S["of"].format(n=len(self.index)), MUTED)))
         if first_idx is not None:
-            ol.highlighted = first_idx
+            ol.highlighted = keep_idx if keep_idx is not None else first_idx
         else:
             self.current = None
             self.query_one("#preview-body", Static).update(Text.assemble(
@@ -861,7 +934,7 @@ class AgentHistory(App):
             return
         i = self.current
         if i["agent"] != "claude":
-            self.notify(S["no_rename"], severity="warning")
+            self.notify(S["no_rename"].format(agent=AGENTS[i["agent"]]["name"]), severity="warning")
             return
 
         def save(name: str | None) -> None:
@@ -891,8 +964,9 @@ def main() -> None:
         for i in load_index():
             print(f"{i['dt']:%Y-%m-%d %H:%M}\t{AGENTS[i['agent']]['short']}\t{i['project']}\t{i['title']}")
         return
-    if not (os.path.isdir(os.path.join(CLAUDE_DIR, "projects")) or os.path.isdir(os.path.join(CODEX_DIR, "sessions"))):
-        sys.exit(S["none_found"].format(a=CLAUDE_DIR, b=CODEX_DIR))
+    dirs = [os.path.join(CLAUDE_DIR, "projects"), os.path.join(CODEX_DIR, "sessions"), pi_sessions_dir()]
+    if not any(os.path.isdir(d) for d in dirs):
+        sys.exit(S["none_found"].format(dirs=", ".join(dirs)))
     agent, rest = None, []
     it = iter(args)
     for a in it:  # --agent X / --agent=X, anywhere on the command line

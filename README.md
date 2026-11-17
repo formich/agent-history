@@ -1,16 +1,16 @@
 # ◆ agent-history
 
 A terminal app to **browse, search and resume** every conversation you've had with your coding
-agents ([Claude Code](https://docs.claude.com/en/docs/claude-code) and
-[Codex](https://github.com/openai/codex)), across all your projects, in one list.
+agents ([Claude Code](https://docs.claude.com/en/docs/claude-code),
+[Codex](https://github.com/openai/codex) and [pi](https://pi.dev/)), across all your projects,
+in one list.
 
 ![agent-history: agents and projects on the left, conversations grouped by day, preview on the right](docs/screenshot.svg)
 
-`claude --resume` and `codex resume` each show their own sessions, and you can't tell what a
-conversation was about until you open it. `agent-history` gives you the "chat list" of the
-desktop apps, in your terminal, for both:
+Each agent's resume picker only shows its own sessions. `agent-history` gives you the
+"chat list" of the desktop apps, in your terminal, for all of them at once:
 
-- **Every session, in one place.** Claude Code and Codex together, grouped by day, with the title
+- **Every session, in one place.** Claude Code, Codex and pi together, grouped by day, with the title
   the agent generated (or the one you gave it), the project, the worktree, the time and how many
   messages you wrote. Each row says which agent it was.
 - **Full-text search.** Type to filter titles, folders, branches *and everything you wrote*.
@@ -19,8 +19,8 @@ desktop apps, in your terminal, for both:
 - **Filter by agent and by project.** Sessions are grouped by repository, so git worktrees
   (`…/worktrees/<repo>/<branch>` or Claude Code's own `<repo>/.claude/worktrees/…`) count as
   the same project.
-- **Resume with Enter.** It `cd`s into the original folder and runs `claude --resume <id>` or
-  `codex resume <id>`. If that folder was deleted (a removed worktree), it recreates it so the
+- **Resume with Enter.** It `cd`s into the original folder and runs `claude --resume <id>`,
+  `codex resume <id>` or `pi --session <file>`. If that folder was deleted (a removed worktree), it recreates it so the
   session can still be resumed.
 - **Rename** a Claude Code conversation (same record as `/rename`), **copy** the resume command,
   or **open** its folder.
@@ -60,18 +60,18 @@ them, the agents list is hidden.
 ```sh
 agent-history             # open the app
 agent-history webhook     # open it with a search already typed
-agent-history --agent codex   # only Codex conversations (or: claude)
+agent-history --agent codex   # only Codex conversations (or: claude, pi)
 agent-history --list      # plain list, for scripts
 ```
 
 | Key | Action |
 |---|---|
 | `Enter` | Resume the selected conversation in its folder |
-| `a` | Switch agent: All → Claude Code → Codex |
+| `a` | Switch agent: All → Claude Code → Codex → pi |
 | `/` | Search (`Esc` clears it, `Esc` again goes back to the list) |
 | `v` | Toggle the whole conversation / short preview |
 | `r` | Rename the conversation, shown with ★ (Claude Code only) |
-| `c` | Copy the `cd … && claude --resume …` / `codex resume …` command |
+| `c` | Copy the `cd … && <agent> resume …` command |
 | `o` | Open the folder in Finder / your file manager |
 | `p` | Jump to the projects list |
 | `Tab` | Move between panes |
@@ -99,19 +99,22 @@ All optional, via environment variables:
 | `AGENT_HISTORY_ROOTS` | `Dev:dev:code:src:projects:repos:git:workspace:Developer` | Folders under `$HOME` that contain your repos; the next path segment becomes the project name |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Where Claude Code keeps its data |
 | `CODEX_HOME` | `~/.codex` | Where Codex keeps its data |
+| `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Where pi keeps its data; its `PI_CODING_AGENT_SESSION_DIR` and `sessionDir` setting are honoured too |
 
 ## How it works
 
-Both agents store each session as a JSON Lines file:
+Each agent stores a session as a JSON Lines file:
 
 - Claude Code: `~/.claude/projects/<folder>/<session-id>.jsonl`
 - Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, with titles in `~/.codex/session_index.jsonl`
+- pi: `~/.pi/agent/sessions/--<folder>--/<timestamp>_<id>.jsonl`, a tree of entries; agent-history
+  shows the branch you were last on
 
 `agent-history` reads those files (read-only, except when you rename a Claude Code conversation),
 keeps a small index in `~/.cache/agent-history/`, and hands off to the agent's own resume command
 when you pick one. Codex sub-agent sessions (such as approval reviews) are hidden.
 
-This is an unofficial tool, not affiliated with Anthropic or OpenAI. The session formats are
+This is an unofficial tool, not affiliated with Anthropic, OpenAI or Earendil. The session formats are
 internal to each agent and may change; if something breaks after an update, please open an issue.
 
 ## Screenshots
