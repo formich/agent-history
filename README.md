@@ -34,12 +34,18 @@ desktop apps, in your terminal, for both:
 You need [uv](https://docs.astral.sh/uv/) (it fetches Python 3.11+ and
 [Textual](https://textual.textualize.io/) on first run, nothing is installed globally).
 
+Download the latest release into a folder on your `PATH`:
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/formich/agent-history/main/agent-history \
+curl -fsSL https://github.com/formich/agent-history/releases/latest/download/agent-history \
   -o ~/.local/bin/agent-history && chmod +x ~/.local/bin/agent-history
 ```
 
-Or clone the repo and symlink the script somewhere on your `PATH`:
+Run the same command again to update. To pin a version, replace `latest/download` with
+`download/v1.0.0`; every [release](https://github.com/formich/agent-history/releases) also
+ships a `SHA256SUMS` file if you want to verify the download.
+
+Or, to follow development, clone the repo and symlink the script:
 
 ```sh
 git clone https://github.com/formich/agent-history.git
@@ -54,12 +60,14 @@ them, the agents list is hidden.
 ```sh
 agent-history             # open the app
 agent-history webhook     # open it with a search already typed
+agent-history --agent codex   # only Codex conversations (or: claude)
 agent-history --list      # plain list, for scripts
 ```
 
 | Key | Action |
 |---|---|
 | `Enter` | Resume the selected conversation in its folder |
+| `a` | Switch agent: All → Claude Code → Codex |
 | `/` | Search (`Esc` clears it, `Esc` again goes back to the list) |
 | `v` | Toggle the whole conversation / short preview |
 | `r` | Rename the conversation, shown with ★ (Claude Code only) |

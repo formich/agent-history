@@ -7,6 +7,8 @@
 
 Usage:
   agent-history [query]   open the app, optionally with an initial search
+  agent-history --agent claude|codex [query]
+                          open it showing only one agent's conversations
   agent-history --list    print a plain list (date, agent, project, title)
   agent-history --help    show this help
 
@@ -48,7 +50,7 @@ from textual.theme import BUILTIN_THEMES
 from textual.widgets import Footer, Input, Label, OptionList, Sparkline, Static
 from textual.widgets.option_list import Option
 
-__version__ = "2.0.0"
+__version__ = "1.0.0"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -85,7 +87,7 @@ STRINGS = {
         "no_rename": "Rename it from Codex itself: renaming here works for Claude Code only",
         "rename_title": "Rename conversation", "rename_hint": "Enter to save · Esc to cancel",
         "k_resume": "Resume", "k_search": "Search", "k_full": "Full/Short", "k_rename": "Rename",
-        "k_copy": "Copy command", "k_open": "Open folder", "k_projects": "Projects",
+        "k_copy": "Copy command", "k_open": "Open folder", "k_projects": "Projects", "k_agent": "Agent",
         "k_back": "Back", "k_quit": "Quit", "k_cancel": "Cancel",
         "recreated": "(recreated empty folder: {cwd})",
         "no_cli": "{cli} is not on your PATH. To resume, run:\n  {cmd}",
@@ -115,7 +117,7 @@ STRINGS = {
         "no_rename": "Rinominala da Codex: qui la rinomina funziona solo per Claude Code",
         "rename_title": "Rinomina conversazione", "rename_hint": "Invio per salvare · Esc per annullare",
         "k_resume": "Riprendi", "k_search": "Cerca", "k_full": "Tutta/Breve", "k_rename": "Rinomina",
-        "k_copy": "Copia comando", "k_open": "Apri cartella", "k_projects": "Progetti",
+        "k_copy": "Copia comando", "k_open": "Apri cartella", "k_projects": "Progetti", "k_agent": "Agente",
         "k_back": "Indietro", "k_quit": "Esci", "k_cancel": "Annulla",
         "recreated": "(cartella ricreata vuota: {cwd})",
         "no_cli": "{cli} non è nel PATH. Per riprenderla esegui:\n  {cmd}",
@@ -558,6 +560,7 @@ class AgentHistory(App):
     """
     BINDINGS = [
         Binding("slash", "focus_search", S["k_search"]),
+        Binding("a", "cycle_agent", S["k_agent"]),
         Binding("v", "toggle_full", S["k_full"]),
         Binding("r", "rename", S["k_rename"]),
         Binding("c", "copy", S["k_copy"]),
@@ -567,9 +570,10 @@ class AgentHistory(App):
         Binding("q", "quit", S["k_quit"]),
     ]
 
-    def __init__(self, query: str = ""):
+    def __init__(self, query: str = "", agent: str | None = None):
         super().__init__()
         self.initial_query = query
+        self.initial_agent = agent
         self.index: list[dict] = []
         self.rows: list[dict] = []
         self.agent_filter: str | None = None
@@ -632,7 +636,9 @@ class AgentHistory(App):
             if counts.get(agent):
                 dot = Text(meta["glyph"] + " ", style=f"bold {meta['color']}")
                 ol.add_option(Option(side_row(dot, meta["name"], counts[agent]), id=f"a:{agent}"))
-        ol.highlighted = 0
+        ids = [o.id for o in ol.options]
+        ol.highlighted = ids.index(f"a:{self.initial_agent}") if f"a:{self.initial_agent}" in ids else 0
+        self.agent_filter = ol.get_option_at_index(ol.highlighted).id[2:] if ol.highlighted else None
         ol.display = len(counts) > 1  # only useful when more than one agent has sessions
 
     def build_projects(self) -> None:
@@ -796,6 +802,14 @@ class AgentHistory(App):
             self.resume_target = self.current
             self.exit()
 
+    def action_cycle_agent(self) -> None:
+        ol = self.query_one("#agents", OptionList)
+        if ol.display and ol.option_count > 1:
+            ol.highlighted = ((ol.highlighted or 0) + 1) % ol.option_count
+            opt = ol.get_option_at_index(ol.highlighted)
+            label = S["all"] if opt.id == "__all__" else AGENTS[opt.id[2:]]["name"]
+            self.notify(label, title=S["agents"], timeout=1.2)
+
     def action_focus_search(self) -> None:
         self.query_one("#search").focus()
 
@@ -879,7 +893,17 @@ def main() -> None:
         return
     if not (os.path.isdir(os.path.join(CLAUDE_DIR, "projects")) or os.path.isdir(os.path.join(CODEX_DIR, "sessions"))):
         sys.exit(S["none_found"].format(a=CLAUDE_DIR, b=CODEX_DIR))
-    app = AgentHistory(" ".join(args))
+    agent, rest = None, []
+    it = iter(args)
+    for a in it:  # --agent X / --agent=X, anywhere on the command line
+        if a == "--agent" or a.startswith("--agent="):
+            agent = (a.split("=", 1)[1] if "=" in a else next(it, "")).lower()
+            if agent not in AGENTS:
+                sys.exit(f"--agent: choose one of {', '.join(AGENTS)}")
+        else:
+            rest.append(a)
+    args = rest
+    app = AgentHistory(" ".join(args), agent)
     app.run()
     i = app.resume_target
     if not i:
