@@ -50,7 +50,6 @@ from collections import Counter
 from datetime import datetime, timedelta
 
 from rich.console import Group
-from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
@@ -66,7 +65,7 @@ from textual.widgets import Footer, Input, Label, OptionList, SelectionList, Spa
 from textual.widgets.selection_list import Selection
 from textual.widgets.option_list import Option
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -75,7 +74,7 @@ PI_DIR = os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or os.path.joi
 CONFIG = os.environ.get("AGENT_HISTORY_CONFIG") or os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "agent-history", "config.toml")
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"),
-                     "agent-history", "index-v4.json")
+                     "agent-history", "index-v5.json")
 ROOTS = set((os.environ.get("AGENT_HISTORY_ROOTS") or os.environ.get("CLAUDE_HISTORY_ROOTS")
              or "Dev:dev:code:src:projects:repos:git:workspace:Developer").split(":"))
 
@@ -184,6 +183,7 @@ RULE = "#2f3549"
 PALETTE = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#0ca30c"]
 OTHER = "#565f89"
 PROJECT_COLOR: dict[str, str] = {}
+PREVIEW_MESSAGES = 40  # messages in the short preview
 
 AGENTS = {
     "claude": {"name": "Claude Code", "short": "Claude", "glyph": "✻", "color": "#ff9e64"},
@@ -220,6 +220,32 @@ def iter_records(path):
                 continue
 
 
+def read_records(path: str, start: int = 0) -> tuple[list[dict], int]:
+    """Parse the complete JSON lines from byte `start`; return them and the new offset.
+
+    A line still being written (no trailing newline) is left for the next read, so
+    sessions that are open in an agent can be read incrementally and safely.
+    """
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        data = fh.read()
+    end = data.rfind(b"\n") + 1
+    out = []
+    for line in data[:end].splitlines():
+        if line.strip():
+            try:
+                out.append(json.loads(line.decode("utf-8", "replace")))
+            except ValueError:
+                continue
+    return out, start + end
+
+
+def file_head(path: str) -> str:
+    """Fingerprint of a file's start, to notice a session file that was rewritten."""
+    with open(path, "rb") as fh:
+        return fh.read(160).decode("latin-1")
+
+
 def new_info(path: str, agent: str, sid: str) -> dict:
     return {"path": path, "agent": agent, "id": sid, "cwd": None, "branch": None,
             "ai_title": None, "custom_title": None, "prompts": [], "first": None,
@@ -243,9 +269,10 @@ def add_message(info: dict, role: str, txt: str) -> None:
 
 
 # Claude Code: ~/.claude/projects/<folder>/<session-id>.jsonl
-def scan_claude(path: str) -> dict:
-    info = new_info(path, "claude", os.path.basename(path)[:-6])
-    for d in iter_records(path):
+def scan_claude(path: str, info: dict | None = None, start: int = 0) -> dict:
+    info = info or new_info(path, "claude", os.path.basename(path)[:-6])
+    records, info["offset"] = read_records(path, start)
+    for d in records:
         t = d.get("type")
         if t == "ai-title" and d.get("aiTitle"):
             info["ai_title"] = d["aiTitle"]
@@ -270,9 +297,10 @@ def claude_messages(path: str):
 
 
 # Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl, titles in session_index.jsonl
-def scan_codex(path: str) -> dict:
-    info = new_info(path, "codex", "")
-    for d in iter_records(path):
+def scan_codex(path: str, info: dict | None = None, start: int = 0) -> dict:
+    info = info or new_info(path, "codex", "")
+    records, info["offset"] = read_records(path, start)
+    for d in records:
         t, p = d.get("type"), d.get("payload") or {}
         if t == "session_meta":
             info["id"] = p.get("id") or p.get("session_id") or ""
@@ -338,7 +366,8 @@ def pi_active_path(path: str) -> tuple[dict | None, list[dict]]:
     return header, chain[::-1]
 
 
-def scan_pi(path: str) -> dict:
+def scan_pi(path: str, info: dict | None = None, start: int = 0) -> dict:
+    # a session is a tree, and the active branch can move anywhere: always read it whole
     header, chain = pi_active_path(path)
     info = new_info(path, "pi", (header or {}).get("id") or os.path.basename(path)[:-6].split("_")[-1])
     info["cwd"] = (header or {}).get("cwd")
@@ -350,6 +379,7 @@ def scan_pi(path: str) -> dict:
             if m.get("role") in ("user", "assistant"):
                 touch(info, d.get("timestamp"))
                 add_message(info, m["role"], text_of(m.get("content")))
+    info["offset"] = None
     return info
 
 
@@ -421,11 +451,22 @@ def load_index(agents: set[str] | None = None) -> list[dict]:
             continue  # switched off: not even read
         for f in find():
             seen.add(f)
-            mtime = os.path.getmtime(f)
+            try:
+                st = os.stat(f)
+            except OSError:
+                continue
             hit = cache.get(f)
-            if not hit or hit.get("mtime") != mtime:
-                hit = scan(f)
-                hit["mtime"] = mtime
+            if not hit or hit.get("mtime") != st.st_mtime:
+                try:
+                    head = file_head(f)
+                    if (hit and hit.get("offset") is not None and hit.get("head") == head
+                            and st.st_size >= hit["offset"]):
+                        hit = scan(f, hit, hit["offset"])  # appended to: read only the new lines
+                    else:
+                        hit = scan(f)
+                except OSError:
+                    continue
+                hit["mtime"], hit["head"] = st.st_mtime, head
                 cache[f] = hit
                 changed = True
             if hit["prompts"] and not hit["hidden"]:
@@ -744,6 +785,7 @@ class AgentHistory(App):
         self.full = False
         self.resume_target: dict | None = None
         self._preview_timer = None
+        self._previewed = False
 
     # ---- layout
     def compose(self) -> ComposeResult:
@@ -777,8 +819,9 @@ class AgentHistory(App):
         self.build_agents(self.initial_agent)
         self.build_projects()
         self.query_one("#search", Input).value = self.initial_query
-        self.refresh_list()
         self.query_one("#list").focus()
+        # build the rows once the list has its real width, so they're drawn only once
+        self.call_after_refresh(self.refresh_list)
         if self.config_error:
             self.notify(self.config_error, severity="warning", timeout=8)
 
@@ -788,7 +831,8 @@ class AgentHistory(App):
         self.call_after_refresh(self._fit_rows)
 
     def _fit_rows(self) -> None:
-        if self.index and self.query_one("#list").content_size.width != getattr(self, "_rows_width", None):
+        built = getattr(self, "_rows_width", None)  # None: the first build hasn't happened yet
+        if self.index and built is not None and self.query_one("#list").content_size.width != built:
             self.refresh_list(keep=True)
 
     def build_activity(self) -> None:
@@ -926,7 +970,11 @@ class AgentHistory(App):
         self.full = False
         if self._preview_timer:
             self._preview_timer.stop()
-        self._preview_timer = self.set_timer(0.08, self.load_preview)
+        if self._previewed:  # debounce while scrolling, but show the first one at once
+            self._preview_timer = self.set_timer(0.08, self.load_preview)
+        else:
+            self._previewed = True
+            self.load_preview()
 
     @on(OptionList.OptionSelected, "#list")
     def list_selected(self) -> None:
@@ -939,7 +987,12 @@ class AgentHistory(App):
 
     @work(thread=True, exclusive=True)
     def render_preview(self, i: dict, full: bool) -> None:
-        msgs = [(role, parse_ts(ts), txt) for role, ts, txt in messages_of(i) if txt]
+        msgs = []
+        for role, ts, txt in messages_of(i):
+            if txt:
+                msgs.append((role, parse_ts(ts), txt))
+                if not full and len(msgs) > PREVIEW_MESSAGES:
+                    break  # the short view shows the first ones: no need to read the rest
         renderable = self.build_preview(i, msgs, full)
         self.call_from_thread(self.show_preview, i, renderable)
 
@@ -950,6 +1003,7 @@ class AgentHistory(App):
         self.query_one("#preview").scroll_home(animate=False)
 
     def build_preview(self, i: dict, msgs, full: bool):
+        from rich.markdown import Markdown  # imported on first preview: saves start-up time
         agent = AGENTS[i["agent"]]
         title = Text()
         if i["starred"]:
@@ -981,7 +1035,7 @@ class AgentHistory(App):
         parts = [Padding(title, (1, 0, 1, 0)), meta, Padding(Rule(style=RULE), (1, 0, 0, 0))]
         terms = self.terms()
         limit_u, limit_a = (None, None) if full else (900, 500)
-        shown = msgs if full else msgs[:40]
+        shown = msgs if full else msgs[:PREVIEW_MESSAGES]
         for kind, ts, txt in shown:
             stamp = f"{ts:%H:%M}" if ts else ""
             if kind == "user":
