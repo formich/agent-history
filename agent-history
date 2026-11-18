@@ -10,6 +10,14 @@ Usage:
   agent-history --agent claude|codex|pi [query]
                           open it showing only one agent's conversations
   agent-history --list    print a plain list (date, agent, project, title)
+
+Agents can be switched off in the app (key: s) or in the config file
+~/.config/agent-history/config.toml (AGENT_HISTORY_CONFIG overrides the path):
+  [agents]
+  claude = true
+  codex = false
+  pi = true
+--agent X shows X for that run even if it's switched off.
   agent-history --help    show this help
 
 Environment:
@@ -33,6 +41,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tomllib
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -49,15 +58,18 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.theme import BUILTIN_THEMES
-from textual.widgets import Footer, Input, Label, OptionList, Sparkline, Static
+from textual.widgets import Footer, Input, Label, OptionList, SelectionList, Sparkline, Static
+from textual.widgets.selection_list import Selection
 from textual.widgets.option_list import Option
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
 CODEX_DIR = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
 PI_DIR = os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(HOME, ".pi", "agent"))
+CONFIG = os.environ.get("AGENT_HISTORY_CONFIG") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "agent-history", "config.toml")
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"),
                      "agent-history", "index-v4.json")
 ROOTS = set((os.environ.get("AGENT_HISTORY_ROOTS") or os.environ.get("CLAUDE_HISTORY_ROOTS")
@@ -91,7 +103,12 @@ STRINGS = {
         "rename_title": "Rename conversation", "rename_hint": "Enter to save · Esc to cancel",
         "k_resume": "Resume", "k_search": "Search", "k_full": "Full/Short", "k_rename": "Rename",
         "k_copy": "Copy command", "k_open": "Open folder", "k_projects": "Projects", "k_agent": "Agent",
-        "k_back": "Back", "k_quit": "Quit", "k_cancel": "Cancel",
+        "k_back": "Back", "k_quit": "Quit", "k_cancel": "Cancel", "k_settings": "Agents on/off",
+        "settings_title": "Agents to include",
+        "settings_hint": "Space switches an agent on/off · Enter saves · Esc cancels",
+        "settings_saved": "Saved to {path}", "settings_need_one": "Keep at least one agent on",
+        "sessions_n": "{n} sessions", "not_found": "not found on this machine",
+        "config_error": "Couldn't read {path} ({err}): using all agents",
         "recreated": "(recreated empty folder: {cwd})",
         "no_cli": "{cli} is not on your PATH. To resume, run:\n  {cmd}",
         "none_found": "No Claude Code, Codex or pi sessions found in {dirs}",
@@ -121,7 +138,12 @@ STRINGS = {
         "rename_title": "Rinomina conversazione", "rename_hint": "Invio per salvare · Esc per annullare",
         "k_resume": "Riprendi", "k_search": "Cerca", "k_full": "Tutta/Breve", "k_rename": "Rinomina",
         "k_copy": "Copia comando", "k_open": "Apri cartella", "k_projects": "Progetti", "k_agent": "Agente",
-        "k_back": "Indietro", "k_quit": "Esci", "k_cancel": "Annulla",
+        "k_back": "Indietro", "k_quit": "Esci", "k_cancel": "Annulla", "k_settings": "Attiva agenti",
+        "settings_title": "Agenti da includere",
+        "settings_hint": "Spazio attiva/disattiva un agente · Invio salva · Esc annulla",
+        "settings_saved": "Salvato in {path}", "settings_need_one": "Lascia attivo almeno un agente",
+        "sessions_n": "{n} sessioni", "not_found": "non trovato su questo computer",
+        "config_error": "Non riesco a leggere {path} ({err}): uso tutti gli agenti",
         "recreated": "(cartella ricreata vuota: {cwd})",
         "no_cli": "{cli} non è nel PATH. Per riprenderla esegui:\n  {cmd}",
         "none_found": "Nessuna sessione di Claude Code, Codex o pi trovata in {dirs}",
@@ -349,7 +371,41 @@ def messages_of(i: dict):
 
 # ───────────────────────────── index ─────────────────────────────
 
-def load_index() -> list[dict]:
+def load_config() -> tuple[dict, str | None]:
+    """Return ({"agents": {name: bool}}, error message or None)."""
+    cfg = {"agents": {a: True for a in AGENTS}}
+    try:
+        with open(CONFIG, "rb") as fh:
+            data = tomllib.load(fh)
+    except FileNotFoundError:
+        return cfg, None
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return cfg, S["config_error"].format(path=CONFIG, err=e)
+    agents = data.get("agents") if isinstance(data.get("agents"), dict) else {}
+    for a in AGENTS:
+        if isinstance(agents.get(a), bool):
+            cfg["agents"][a] = agents[a]
+    if not any(cfg["agents"].values()):
+        cfg["agents"] = {a: True for a in AGENTS}
+    return cfg, None
+
+
+def save_config(cfg: dict) -> None:
+    lines = ["# agent-history settings. Also editable from the app (key: s);",
+             "# saving from the app rewrites this file.", "", "[agents]"]
+    lines += [f"{a} = {'true' if cfg['agents'].get(a, True) else 'false'}" for a in AGENTS]
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG + ".tmp", "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(CONFIG + ".tmp", CONFIG)
+
+
+def session_files(agent: str) -> int:
+    return len(SOURCES[agent][0]())
+
+
+def load_index(agents: set[str] | None = None) -> list[dict]:
+    agents = set(AGENTS) if agents is None else agents
     try:
         with open(CACHE) as fh:
             cache = json.load(fh)
@@ -357,6 +413,8 @@ def load_index() -> list[dict]:
         cache = {}
     seen, out, changed = set(), [], False
     for agent, (find, scan) in SOURCES.items():
+        if agent not in agents:
+            continue  # switched off: not even read
         for f in find():
             seen.add(f)
             mtime = os.path.getmtime(f)
@@ -368,7 +426,8 @@ def load_index() -> list[dict]:
                 changed = True
             if hit["prompts"] and not hit["hidden"]:
                 out.append(hit)
-    for f in [f for f in cache if f not in seen]:
+    # forget deleted sessions, but keep the cache of agents that are switched off
+    for f in [f for f, hit in cache.items() if f not in seen and hit.get("agent") in agents]:
         del cache[f]
         changed = True
     if changed:
@@ -514,7 +573,9 @@ def row_prompt(i: dict, terms: list[str], width: int = 56) -> Text:
     count = S["message"] if i["n_user"] == 1 else S["messages"].format(n=i["n_user"])
     t.append(f"{when}  ·  {count}", style=MUTED)
     if not i["exists"]:
-        t.append(f"  ·  ⚠ {S['folder_gone']}", style=CRITICAL)
+        used = 4 + len(AGENTS[i["agent"]]["short"]) + len(when) + 5 + len(count)
+        gone = f"  ·  ⚠ {S['folder_gone']}"
+        t.append(gone if used + len(gone) <= width else "  ⚠", style=CRITICAL)
     snip = snippet(i, terms, width)
     if snip:
         t.append("\n")
@@ -540,9 +601,11 @@ def snippet(i: dict, terms: list[str], width: int) -> Text | None:
 
 def side_row(dot: Text, name: str, n: int, bold=False, width: int = 22) -> Text:
     t = Text(no_wrap=True, overflow="ellipsis")
+    if n == 0:  # no matches: keep the row (the list must not jump) but recede
+        dot = Text(dot.plain, style=OTHER)
     t.append_text(dot)
     label = fit(name, width - len(str(n)) - 1)
-    t.append(label, style=f"{'bold ' if bold else ''}{INK}")
+    t.append(label, style=MUTED if n == 0 else f"{'bold ' if bold else ''}{INK}")
     t.append(" " * max(1, width - len(label) - len(str(n))))
     t.append(str(n), style=MUTED)
     return t
@@ -570,6 +633,36 @@ class RenameScreen(ModalScreen[str | None]):
     @on(Input.Submitted)
     def done(self, ev: Input.Submitted) -> None:
         self.dismiss(ev.value.strip() or None)
+
+
+class AgentsScreen(ModalScreen[set | None]):
+    """Switch agents on/off; the caller persists the result."""
+    BINDINGS = [Binding("escape", "dismiss(None)", S["k_cancel"]),
+                Binding("enter", "save", S["saved"], priority=True)]
+
+    def __init__(self, enabled: set[str], counts: dict[str, int]):
+        super().__init__()
+        self.enabled, self.counts = enabled, counts
+
+    def compose(self) -> ComposeResult:
+        items = []
+        for a, meta in AGENTS.items():
+            n = self.counts.get(a)
+            note = S["not_found"] if n is None else S["sessions_n"].format(n=n)
+            prompt = Text.assemble((meta["glyph"] + " ", f"bold {meta['color']}"),
+                                   (f"{meta['name']:<14}", INK), (note, MUTED))
+            items.append(Selection(prompt, a, a in self.enabled))
+        with Vertical(id="dialog"):
+            yield Label(S["settings_title"], id="dialog-title")
+            yield SelectionList[str](*items, id="agent-toggles")
+            yield Label(S["settings_hint"], id="dialog-hint")
+
+    def action_save(self) -> None:
+        chosen = set(self.query_one("#agent-toggles", SelectionList).selected)
+        if not chosen:
+            self.notify(S["settings_need_one"], severity="warning")
+            return
+        self.dismiss(chosen)
 
 
 def make_theme():
@@ -612,7 +705,8 @@ class AgentHistory(App):
     #preview { width: 1fr; border: round #3b4261; padding: 0 2; margin: 0 1 0 0; }
     #preview:focus-within { border: round $primary; }
 
-    RenameScreen { align: center middle; }
+    RenameScreen, AgentsScreen { align: center middle; background: $background 60%; }
+    #agent-toggles { height: auto; border: none; background: $panel; }
     #dialog { width: 70; height: auto; padding: 1 2; border: round $primary; background: $panel; }
     #dialog-title { text-style: bold; padding-bottom: 1; }
     #dialog-hint { color: $text-muted; padding-top: 1; }
@@ -624,6 +718,7 @@ class AgentHistory(App):
         Binding("r", "rename", S["k_rename"]),
         Binding("c", "copy", S["k_copy"]),
         Binding("o", "open_folder", S["k_open"]),
+        Binding("s", "agents_settings", S["k_settings"]),
         Binding("p", "focus_projects", S["k_projects"], show=False),
         Binding("escape", "back", S["k_back"], show=False),
         Binding("q", "quit", S["k_quit"]),
@@ -633,6 +728,10 @@ class AgentHistory(App):
         super().__init__()
         self.initial_query = query
         self.initial_agent = agent
+        self.config, self.config_error = load_config()
+        self.enabled = {a for a, on in self.config["agents"].items() if on}
+        if agent:
+            self.enabled.add(agent)  # --agent X wins over the config for this run
         self.index: list[dict] = []
         self.rows: list[dict] = []
         self.agent_filter: str | None = None
@@ -669,13 +768,15 @@ class AgentHistory(App):
         self.query_one("#projects").border_title = S["projects"]
         self.query_one("#list").border_title = S["conversations"]
         self.query_one("#preview").border_title = S["preview"]
-        self.index = load_index()
+        self.index = load_index(self.enabled)
         self.build_activity()
-        self.build_agents()
+        self.build_agents(self.initial_agent)
         self.build_projects()
         self.query_one("#search", Input).value = self.initial_query
         self.refresh_list()
         self.query_one("#list").focus()
+        if self.config_error:
+            self.notify(self.config_error, severity="warning", timeout=8)
 
     @on(events.Resize)
     def relayout_rows(self) -> None:
@@ -695,8 +796,9 @@ class AgentHistory(App):
             (S["today_lc"], MUTED), (str(data[-1]), f"bold {INK}"),
             (S["peak"], MUTED), (str(max(data)), f"bold {INK}")))
 
-    def build_agents(self) -> None:
+    def build_agents(self, select: str | None = None) -> None:
         ol = self.query_one("#agents", OptionList)
+        ol.clear_options()
         counts = Counter(i["agent"] for i in self.index)
         ol.add_option(Option(side_row(Text("● ", style=INK_2), S["all"], len(self.index), bold=True),
                              id="__all__"))
@@ -705,18 +807,45 @@ class AgentHistory(App):
                 dot = Text(meta["glyph"] + " ", style=f"bold {meta['color']}")
                 ol.add_option(Option(side_row(dot, meta["name"], counts[agent]), id=f"a:{agent}"))
         ids = [o.id for o in ol.options]
-        ol.highlighted = ids.index(f"a:{self.initial_agent}") if f"a:{self.initial_agent}" in ids else 0
+        ol.highlighted = ids.index(f"a:{select}") if f"a:{select}" in ids else 0
         self.agent_filter = ol.get_option_at_index(ol.highlighted).id[2:] if ol.highlighted else None
         ol.display = len(counts) > 1  # only useful when more than one agent has sessions
 
     def build_projects(self) -> None:
         ol = self.query_one("#projects", OptionList)
+        ol.clear_options()
         counts = Counter(i["project"] for i in self.index)
+        self.project_names = sorted(counts, key=lambda p: (-counts[p], p))
+        if self.project_filter not in counts:
+            self.project_filter = None
         ol.add_option(Option(side_row(Text("● ", style=INK_2), S["all"], len(self.index), bold=True),
                              id="__all__"))
-        for name, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-            ol.add_option(Option(side_row(Text("● ", style=color_for(name)), name, n), id=f"p:{name}"))
-        ol.highlighted = 0
+        for name in self.project_names:
+            ol.add_option(Option(side_row(Text("● ", style=color_for(name)), name, counts[name]),
+                                 id=f"p:{name}"))
+        ids = [o.id for o in ol.options]
+        ol.highlighted = ids.index(f"p:{self.project_filter}") if self.project_filter else 0
+
+    def update_counts(self, terms: list[str]) -> None:
+        """Facet counts: each side list counts matches under the *other* filters."""
+        hits = [i for i in self.index if all(t in i["haystack"] for t in terms)]
+        by_agent = Counter(i["agent"] for i in hits
+                           if self.project_filter is None or i["project"] == self.project_filter)
+        by_project = Counter(i["project"] for i in hits
+                             if self.agent_filter is None or i["agent"] == self.agent_filter)
+        agents = self.query_one("#agents", OptionList)
+        all_dot = Text("● ", style=INK_2)
+        agents.replace_option_prompt("__all__", side_row(all_dot, S["all"], sum(by_agent.values()), bold=True))
+        for o in list(agents.options):
+            if o.id and o.id.startswith("a:"):
+                a = AGENTS[o.id[2:]]
+                agents.replace_option_prompt(o.id, side_row(
+                    Text(a["glyph"] + " ", style=f"bold {a['color']}"), a["name"], by_agent[o.id[2:]]))
+        projects = self.query_one("#projects", OptionList)
+        projects.replace_option_prompt("__all__", side_row(all_dot, S["all"], sum(by_project.values()), bold=True))
+        for name in self.project_names:
+            projects.replace_option_prompt(f"p:{name}", side_row(
+                Text("● ", style=color_for(name)), name, by_project[name]))
 
     # ---- filtering
     def terms(self) -> list[str]:
@@ -748,6 +877,7 @@ class AgentHistory(App):
         ol.add_options(opts)
         self.query_one("#count", Static).update(Text.assemble(
             (str(len(self.rows)), f"bold {INK}"), (S["of"].format(n=len(self.index)), MUTED)))
+        self.update_counts(terms)
         if first_idx is not None:
             ol.highlighted = keep_idx if keep_idx is not None else first_idx
         else:
@@ -883,6 +1013,40 @@ class AgentHistory(App):
             label = S["all"] if opt.id == "__all__" else AGENTS[opt.id[2:]]["name"]
             self.notify(label, title=S["agents"], timeout=1.2)
 
+    def action_agents_settings(self) -> None:
+        counts = {}
+        for a in AGENTS:
+            if a in self.enabled:
+                counts[a] = sum(1 for i in self.index if i["agent"] == a)
+            else:  # not loaded: count its session files instead
+                n = session_files(a)
+                counts[a] = n if n else None
+        on_now = {a for a, on in self.config["agents"].items() if on}
+
+        def apply(chosen: set | None) -> None:
+            if chosen is None:
+                return
+            self.config["agents"] = {a: a in chosen for a in AGENTS}
+            try:
+                save_config(self.config)
+                self.notify(S["settings_saved"].format(path=CONFIG.replace(HOME, "~")), title=S["saved"])
+            except OSError as e:
+                self.notify(str(e), severity="error")
+            if chosen != self.enabled:
+                self.enabled = set(chosen)
+                self.reload()
+
+        self.push_screen(AgentsScreen(on_now, counts), apply)
+
+    def reload(self) -> None:
+        self.index = load_index(self.enabled)
+        if self.agent_filter not in self.enabled:
+            self.agent_filter = None
+        self.build_activity()
+        self.build_agents(self.agent_filter)
+        self.build_projects()
+        self.refresh_list(keep=True)
+
     def action_focus_search(self) -> None:
         self.query_one("#search").focus()
 
@@ -961,7 +1125,10 @@ def main() -> None:
         print(f"agent-history {__version__}")
         return
     if args[:1] == ["--list"]:
-        for i in load_index():
+        cfg, err = load_config()
+        if err:
+            print(err, file=sys.stderr)
+        for i in load_index({a for a, on in cfg["agents"].items() if on}):
             print(f"{i['dt']:%Y-%m-%d %H:%M}\t{AGENTS[i['agent']]['short']}\t{i['project']}\t{i['title']}")
         return
     dirs = [os.path.join(CLAUDE_DIR, "projects"), os.path.join(CODEX_DIR, "sessions"), pi_sessions_dir()]

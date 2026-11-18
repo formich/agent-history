@@ -16,7 +16,7 @@ Each agent's resume picker only shows its own sessions. `agent-history` gives yo
 - **Full-text search.** Type to filter titles, folders, branches *and everything you wrote*.
   Matches are highlighted, and when the match is in the text you see the sentence it came from.
 - **Preview before you open.** Your messages and the agent's replies, rendered as Markdown.
-- **Filter by agent and by project.** Sessions are grouped by repository, so git worktrees
+- **Filter by agent and by project**, with counts that follow your search. Sessions are grouped by repository, so git worktrees
   (`…/worktrees/<repo>/<branch>` or Claude Code's own `<repo>/.claude/worktrees/…`) count as
   the same project.
 - **Resume with Enter.** It `cd`s into the original folder and runs `claude --resume <id>`,
@@ -73,6 +73,7 @@ agent-history --list      # plain list, for scripts
 | `r` | Rename the conversation, shown with ★ (Claude Code only) |
 | `c` | Copy the `cd … && <agent> resume …` command |
 | `o` | Open the folder in Finder / your file manager |
+| `s` | Choose which agents to include (saved to the config file) |
 | `p` | Jump to the projects list |
 | `Tab` | Move between panes |
 | `Ctrl+P` | Command palette (themes, quit, …) |
@@ -91,11 +92,29 @@ Claude Code **deletes sessions older than 30 days** by default. To keep them, ra
 
 ## Configuration
 
-All optional, via environment variables:
+### Agents to include
+
+Press `s` in the app to switch agents on or off, or edit
+`~/.config/agent-history/config.toml` (created the first time you save from the app):
+
+```toml
+[agents]
+claude = true
+codex = false
+pi = false
+```
+
+Switched-off agents are not read at all, so start-up is faster too. `--agent X` still shows
+agent X for that run, even if it's switched off.
+
+### Environment variables
+
+All optional:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `AGENT_HISTORY_LANG` | from `LANG` | `en` or `it` |
+| `AGENT_HISTORY_CONFIG` | `~/.config/agent-history/config.toml` | Config file path (`$XDG_CONFIG_HOME` is honoured) |
 | `AGENT_HISTORY_ROOTS` | `Dev:dev:code:src:projects:repos:git:workspace:Developer` | Folders under `$HOME` that contain your repos; the next path segment becomes the project name |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Where Claude Code keeps its data |
 | `CODEX_HOME` | `~/.codex` | Where Codex keeps its data |
