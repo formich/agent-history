@@ -3,31 +3,35 @@
 # requires-python = ">=3.11"
 # dependencies = ["textual>=1.0"]
 # ///
-"""agent-history — browse, search and resume your Claude Code, Codex and pi conversations.
+"""agent-history — one history for all your AI coding agents.
+
+Browse, search and resume the conversations you've had with your coding agents,
+across all your projects, in one terminal app.
+
+Supported agents: @AGENTS@
 
 Usage:
-  agent-history [query]   open the app, optionally with an initial search
-  agent-history --agent claude|codex|pi [query]
-                          open it showing only one agent's conversations
-  agent-history --list    print a plain list (date, agent, project, title)
+  agent-history [query]          open the app, optionally with an initial search
+  agent-history --agent NAME [query]
+                                 show only one agent's conversations (@NAMES@)
+  agent-history --list           print a plain list (date, agent, project, title)
+  agent-history --help           show this help
+  agent-history --version        show the version
 
-Agents can be switched off in the app (key: s) or in the config file
+Agents can be switched on/off in the app (key: s) or in the config file
 ~/.config/agent-history/config.toml (AGENT_HISTORY_CONFIG overrides the path):
   [agents]
-  claude = true
-  codex = false
-  pi = true
---agent X shows X for that run even if it's switched off.
-  agent-history --help    show this help
+  @EXAMPLE@
+Agents missing from the file are on. --agent NAME shows that agent for the run
+even if it's switched off.
 
 Environment:
   AGENT_HISTORY_LANG    "en" or "it" (default: from LANG / LC_ALL)
+  AGENT_HISTORY_CONFIG  config file path
   AGENT_HISTORY_ROOTS   colon-separated folder names under $HOME that hold your
                         repos (default: Dev:dev:code:src:projects:repos:git:workspace:Developer)
-  CLAUDE_CONFIG_DIR     Claude Code data dir (default: ~/.claude)
-  CODEX_HOME            Codex data dir (default: ~/.codex)
-  PI_CODING_AGENT_DIR   pi agent dir (default: ~/.pi/agent); sessions honour
-                        PI_CODING_AGENT_SESSION_DIR and the "sessionDir" setting
+  Each agent's own data-dir variable is honoured too: CLAUDE_CONFIG_DIR (Claude Code),
+  CODEX_HOME (Codex), PI_CODING_AGENT_DIR / PI_CODING_AGENT_SESSION_DIR (pi).
 
 https://github.com/formich/agent-history — MIT License
 """
@@ -111,7 +115,7 @@ STRINGS = {
         "config_error": "Couldn't read {path} ({err}): using all agents",
         "recreated": "(recreated empty folder: {cwd})",
         "no_cli": "{cli} is not on your PATH. To resume, run:\n  {cmd}",
-        "none_found": "No Claude Code, Codex or pi sessions found in {dirs}",
+        "none_found": "No sessions found for any supported agent ({agents}) in {dirs}",
     },
     "it": {
         "months": ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
@@ -146,7 +150,7 @@ STRINGS = {
         "config_error": "Non riesco a leggere {path} ({err}): uso tutti gli agenti",
         "recreated": "(cartella ricreata vuota: {cwd})",
         "no_cli": "{cli} non è nel PATH. Per riprenderla esegui:\n  {cmd}",
-        "none_found": "Nessuna sessione di Claude Code, Codex o pi trovata in {dirs}",
+        "none_found": "Nessuna sessione trovata per gli agenti supportati ({agents}) in {dirs}",
     },
 }
 
@@ -1119,7 +1123,10 @@ class AgentHistory(App):
 def main() -> None:
     args = sys.argv[1:]
     if args[:1] in (["-h"], ["--help"]):
-        print(__doc__.strip())
+        print(__doc__.strip()
+              .replace("@AGENTS@", ", ".join(a["name"] for a in AGENTS.values()))
+              .replace("@NAMES@", ", ".join(AGENTS))
+              .replace("@EXAMPLE@", "\n  ".join(f"{a} = true" for a in AGENTS)))
         return
     if args[:1] in (["-V"], ["--version"]):
         print(f"agent-history {__version__}")
@@ -1133,7 +1140,8 @@ def main() -> None:
         return
     dirs = [os.path.join(CLAUDE_DIR, "projects"), os.path.join(CODEX_DIR, "sessions"), pi_sessions_dir()]
     if not any(os.path.isdir(d) for d in dirs):
-        sys.exit(S["none_found"].format(dirs=", ".join(dirs)))
+        sys.exit(S["none_found"].format(agents=", ".join(a["name"] for a in AGENTS.values()),
+                                        dirs=", ".join(dirs)))
     agent, rest = None, []
     it = iter(args)
     for a in it:  # --agent X / --agent=X, anywhere on the command line
