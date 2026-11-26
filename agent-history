@@ -65,7 +65,7 @@ from textual.widgets import Footer, Input, Label, OptionList, SelectionList, Spa
 from textual.widgets.selection_list import Selection
 from textual.widgets.option_list import Option
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -1212,12 +1212,16 @@ def main() -> None:
     if not i:
         return
     cwd, argv = i["cwd"] or HOME, resume_argv(i)
-    if not shutil.which(argv[0]):
+    executable = shutil.which(argv[0])
+    if not executable:
         sys.exit(S["no_cli"].format(cli=argv[0], cmd=resume_command(i)))
     if not os.path.isdir(cwd):
         # both CLIs look sessions up from the folder they ran in, so it must exist
         os.makedirs(cwd, exist_ok=True)
         print(S["recreated"].format(cwd=cwd), file=sys.stderr)
+    if os.name == "nt":
+        # Keep the launcher alive until the agent exits so the shell waits too.
+        sys.exit(subprocess.run([os.path.abspath(executable), *argv[1:]], cwd=cwd).returncode)
     os.chdir(cwd)
     os.execvp(argv[0], argv)
 
