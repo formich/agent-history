@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["textual>=1.0"]
+# dependencies = ["textual==8.2.8"]
 # ///
 """agent-history — one history for all your AI coding agents.
 
@@ -45,6 +45,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections import Counter
 from datetime import datetime, timedelta
@@ -65,7 +66,7 @@ from textual.widgets import Footer, Input, Label, OptionList, SelectionList, Spa
 from textual.widgets.selection_list import Selection
 from textual.widgets.option_list import Option
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -442,6 +443,8 @@ def load_index(agents: set[str] | None = None) -> list[dict]:
     agents = set(AGENTS) if agents is None else agents
     try:
         with open(CACHE) as fh:
+            if os.name == "posix":
+                os.fchmod(fh.fileno(), 0o600)
             cache = json.load(fh)
     except (OSError, ValueError):
         cache = {}
@@ -476,10 +479,23 @@ def load_index(agents: set[str] | None = None) -> list[dict]:
         del cache[f]
         changed = True
     if changed:
-        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-        with open(CACHE + ".tmp", "w") as fh:
-            json.dump(cache, fh)
-        os.replace(CACHE + ".tmp", CACHE)
+        cache_dir = os.path.dirname(CACHE)
+        temporary_path = None
+        try:
+            os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=cache_dir, delete=False) as fh:
+                temporary_path = fh.name
+                json.dump(cache, fh)
+            os.replace(temporary_path, CACHE)
+        except OSError:
+            # Browsing still works when the cache directory is unwritable.
+            pass
+        finally:
+            if temporary_path is not None and os.path.exists(temporary_path):
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
     titles = codex_titles()
     for i in out:
         if i["agent"] == "codex":

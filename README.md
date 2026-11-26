@@ -170,8 +170,8 @@ Please test with real session files from the agent, and never commit real conver
 The screenshots are generated from invented sessions by `scripts/screenshot.py`:
 
 ```sh
-uv run --with 'textual>=1.0' python scripts/screenshot.py           # docs/screenshot.svg
-uv run --with 'textual>=1.0' python scripts/screenshot.py retries   # docs/screenshot-search.svg
+uv run --with 'textual==8.2.8' python scripts/screenshot.py           # docs/screenshot.svg
+uv run --with 'textual==8.2.8' python scripts/screenshot.py retries   # docs/screenshot-search.svg
 ```
 
 ## License

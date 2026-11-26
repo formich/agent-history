@@ -1,6 +1,6 @@
 """Render docs/screenshot.svg from a fake, generated set of sessions.
 
-    uv run --with 'textual>=1.0' python scripts/screenshot.py [query]
+    uv run --with 'textual==8.2.8' python scripts/screenshot.py [query]
 
 No real conversation data is used: everything below is invented.
 """
